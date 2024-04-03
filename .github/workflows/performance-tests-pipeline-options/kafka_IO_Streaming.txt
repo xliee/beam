@@ -24,5 +24,4 @@
 --readTimeout=1500
 --numWorkers=5
 --autoscalingAlgorithm=NONE
---region=europe-west3-a
 --experiments=use_runner_v2,use_unified_worker
