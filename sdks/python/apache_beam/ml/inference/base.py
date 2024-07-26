@@ -27,6 +27,7 @@ The transform handles standard inference functionality, like metric
 collection, sharing model between threads, and batching elements.
 """
 
+import concurrent.futures
 import logging
 import os
 import pickle
@@ -1168,6 +1169,8 @@ class RunInference(beam.PTransform[beam.PCollection[Union[ExampleT,
     self._metrics_namespace = metrics_namespace
     self._model_metadata_pcoll = model_metadata_pcoll
     self._with_exception_handling = False
+    # TODO - plumb through a model load timeout as well; this will likely be different from other timeouts
+    self._timeout = None
     self._watch_model_pattern = watch_model_pattern
     self._kwargs = kwargs
     # Generate a random tag to use for shared.py and multi_process_shared.py to
@@ -1230,7 +1233,8 @@ class RunInference(beam.PTransform[beam.PCollection[Union[ExampleT,
           fn).with_exception_handling(
           exc_class=self._exc_class,
           use_subprocess=self._use_subprocess,
-          threshold=self._threshold))
+          threshold=self._threshold,
+          timeout=self._timeout))
         bad_preprocessed.append(bad)
       else:
         pcoll = pcoll | f"{step_prefix}-{idx}" >> beam.Map(fn)
@@ -1275,7 +1279,8 @@ class RunInference(beam.PTransform[beam.PCollection[Union[ExampleT,
             self._clock,
             self._metrics_namespace,
             self._model_metadata_pcoll is not None,
-            self._model_tag),
+            self._model_tag,
+            self._timeout),
         self._inference_args,
         beam.pvalue.AsSingleton(
             self._model_metadata_pcoll,
@@ -1283,6 +1288,9 @@ class RunInference(beam.PTransform[beam.PCollection[Union[ExampleT,
             **resource_hints)
 
     if self._with_exception_handling:
+      # Don't pass in timeout parameter; _RunInferenceDoFn handles this itself
+      # so that it can clean up any additional processes created to host a
+      # model and free up that memory.
       results, bad_inference = (
           batched_elements_pcoll
           | 'BeamML_RunInference' >>
@@ -1305,7 +1313,7 @@ class RunInference(beam.PTransform[beam.PCollection[Union[ExampleT,
     return results
 
   def with_exception_handling(
-      self, *, exc_class=Exception, use_subprocess=False, threshold=1):
+      self, *, exc_class=Exception, use_subprocess=False, threshold=1, timeout=None):
     """Automatically provides a dead letter output for skipping bad records.
     This can allow a pipeline to continue successfully rather than fail or
     continuously throw errors on retry when bad elements are encountered.
@@ -1359,11 +1367,13 @@ class RunInference(beam.PTransform[beam.PCollection[Union[ExampleT,
       threshold: An upper bound on the ratio of records that can be bad before
           aborting the entire pipeline. Optional, defaults to 1.0 (meaning
           up to 100% of records can be bad and the pipeline will still succeed).
+      timeout: TODO - add description
     """
     self._with_exception_handling = True
     self._exc_class = exc_class
     self._use_subprocess = use_subprocess
     self._threshold = threshold
+    self._timeout = timeout
     return self
 
 
@@ -1445,30 +1455,93 @@ class _ModelRoutingStrategy():
     return self._cur_index
 
 
-class _SharedModelWrapper():
+# TODO - What if we just stick model = self._model_handler.load_model() into a wrapper which loads it in a subprocess. Then we can kill the subprocess and reload the model with the next call.
+class _MaybeSubProcessModelWrapper():
+  """A wrapper class used to sit a model in its own process when appropriate.
+
+  This class is used to put a model inside its own process so that it can be
+  easily torn down if needed (e.g. if an inference timeout is exceeded,
+  indicating potential deadlock).
+
+  This wrapper may already sit inside a multiprocess shared object.
+  Even in these cases, if a subprocess should be used it will create a new
+  one so that it can manage creation/deletion of that subprocess. This makes it
+  easier to manage refcounts and tear down the model process when needed since
+  there is a single caller, rather than each worker process being able to see
+  the model directly.
+  """
+  def __init__(self, model_handler: ModelHandler, model_load_timeout_seconds: Optional[int] = None, use_subprocess: bool = False):
+    self._model_handler = model_handler
+    self._model_load_timeout = model_load_timeout_seconds
+    self._use_subprocess = use_subprocess
+    self._model_handle = None
+    self._pool = None
+    self._model = None
+    self._load_model()
+
+  def get_model(self) -> Any:
+    if self._model is None:
+      self._load_model()
+    return self._model
+    
+  def _load_model(self):
+    self._model_handle is None
+    model_acquire_fn = self._model_handler.load_model
+    if self._use_subprocess:
+      self._model_handle = multi_process_shared.MultiProcessShared(
+            self._model_handler.load_model, tag=uuid.uuid4().hex, always_proxy=True)
+      model_acquire_fn = self._model_handle.acquire
+
+    if self._model_load_timeout is None:
+      self._model = model_acquire_fn()
+      return
+
+    if self._pool is None:
+      self._pool = concurrent.futures.ThreadPoolExecutor(10)
+    # Ensure we iterate over the entire output list in the given amount of time.
+    try:
+      self._model = self._pool.submit(model_acquire_fn).result(
+              self._model_load_timeout_seconds)
+    except TimeoutError:
+      self._pool.shutdown(wait=False)
+      self._pool = None
+      if self._model_handle is not None:
+        self._model_handle.release()
+      self._model_handle = None
+      self._model = None
+      raise Exception('Timed out waiting for model to load')
+
+  def reset_model(self):
+    if self._model_handle is not None:
+      self._model = None
+      self._model_handle.release()
+      self._load_model()
+
+
+class _SharedModelRouter():
   """A router class to map incoming calls to the correct model.
   
     This allows us to round robin calls to models sitting in different
     processes so that we can more efficiently use resources (e.g. GPUs).
   """
-  def __init__(self, models: List[Any], model_tag: str):
-    self.models = models
-    if len(models) > 1:
+  def __init__(self, model_wrappers: List[_MaybeSubProcessModelWrapper], model_tag: str):
+    self._model_wrappers = model_wrappers
+    if len(model_wrappers) > 1:
       self.model_router = multi_process_shared.MultiProcessShared(
           lambda: _ModelRoutingStrategy(),
           tag=f'{model_tag}_counter',
           always_proxy=True).acquire()
 
-  def next_model(self):
-    if len(self.models) == 1:
+  def next_model_wrapper(self) -> _MaybeSubProcessModelWrapper:
+    if len(self._model_wrappers) == 1:
       # Short circuit if there's no routing strategy needed in order to
       # avoid the cross-process call
-      return self.models[0]
+      return self._model_wrappers[0]
 
-    return self.models[self.model_router.next_model_index(len(self.models))]
+    return self._model_wrappers[self.model_router.next_model_wrapper_index(len(self._model_wrappers))]
 
-  def all_models(self):
-    return self.models
+  def all_model_wrappers(self) -> List[_MaybeSubProcessModelWrapper]:
+    return self._model_wrappers
 
 
 class _RunInferenceDoFn(beam.DoFn, Generic[ExampleT, PredictionT]):
@@ -1478,7 +1551,8 @@ class _RunInferenceDoFn(beam.DoFn, Generic[ExampleT, PredictionT]):
       clock,
       metrics_namespace,
       enable_side_input_loading: bool = False,
-      model_tag: str = "RunInference"):
+      model_tag: str = "RunInference",
+      timeout: Optional[int] = None):
     """A DoFn implementation generic to frameworks.
 
       Args:
@@ -1488,22 +1562,25 @@ class _RunInferenceDoFn(beam.DoFn, Generic[ExampleT, PredictionT]):
         enable_side_input_loading: Bool to indicate if model updates
             with side inputs.
         model_tag: Tag to use to disambiguate models in multi-model settings.
+        timeout: TODO - add description
     """
     self._model_handler = model_handler
     self._shared_model_handle = shared.Shared()
     self._clock = clock
-    self._model = None
+    self._model: Optional[_SharedModelRouter] = None
     self._metrics_namespace = metrics_namespace
     self._enable_side_input_loading = enable_side_input_loading
     self._side_input_path = None
     self._model_tag = model_tag
+    self._timeout = timeout
+    self._pool = None
 
   def _load_model(
       self,
       side_input_model_path: Optional[Union[str,
                                             List[KeyModelPathMapping]]] = None
-  ) -> _SharedModelWrapper:
-    def load():
+  ) -> _SharedModelRouter:
+    def load() -> _MaybeSubProcessModelWrapper:
       """Function for constructing shared LoadedModel."""
       memory_before = _get_current_process_memory_in_bytes()
       start_time = _to_milliseconds(self._clock.time_ns())
@@ -1511,10 +1588,14 @@ class _RunInferenceDoFn(beam.DoFn, Generic[ExampleT, PredictionT]):
         self._model_handler.update_model_path(side_input_model_path)
       else:
         if self._model is not None:
-          models = self._model.all_models()
-          for m in models:
-            self._model_handler.update_model_paths(m, side_input_model_path)
-      model = self._model_handler.load_model()
+          model_wrappers = self._model.all_model_wrappers()
+          for m in model_wrappers:
+            self._model_handler.update_model_paths(m.get_model(), side_input_model_path)
+      # If we want to interrupt inference on a timeout, then we'll create the
+      # model in a subprocess so that it can be neatly cleaned up
+      use_subprocess_for_loading = self._timeout is not None or self._model_handler.share_model_across_processes()
+      # TODO - add model_load_timeout.
+      model_wrapper = _MaybeSubProcessModelWrapper(self._model_handler, use_subprocess=use_subprocess_for_loading)
       end_time = _to_milliseconds(self._clock.time_ns())
       memory_after = _get_current_process_memory_in_bytes()
       load_model_latency_ms = end_time - start_time
@@ -1522,7 +1603,7 @@ class _RunInferenceDoFn(beam.DoFn, Generic[ExampleT, PredictionT]):
       if self._metrics_collector:
         self._metrics_collector.cache_load_model_metrics(
             load_model_latency_ms, model_byte_size)
-      return model
+      return model_wrapper
 
     # TODO(https://github.com/apache/beam/issues/21443): Investigate releasing
     # model.
@@ -1535,10 +1616,10 @@ class _RunInferenceDoFn(beam.DoFn, Generic[ExampleT, PredictionT]):
         models.append(
             multi_process_shared.MultiProcessShared(
                 load, tag=f'{model_tag}{i}', always_proxy=True).acquire())
-      model_wrapper = _SharedModelWrapper(models, model_tag)
+      model_wrapper = _SharedModelRouter(models, model_tag)
     else:
       model = self._shared_model_handle.acquire(load, tag=model_tag)
-      model_wrapper = _SharedModelWrapper([model], model_tag)
+      model_wrapper = _SharedModelRouter([model], model_tag)
     # since shared_model_handle is shared across threads, the model path
     # might not get updated in the model handler
     # because we directly get cached weak ref model from shared cache, instead
@@ -1547,9 +1628,9 @@ class _RunInferenceDoFn(beam.DoFn, Generic[ExampleT, PredictionT]):
       self._model_handler.update_model_path(side_input_model_path)
     else:
       if self._model is not None:
-        models = self._model.all_models()
-        for m in models:
-          self._model_handler.update_model_paths(m, side_input_model_path)
+        model_wrappers = self._model.all_model_wrappers()
+        for m in model_wrappers:
+          self._model_handler.update_model_paths(m.get_model(), side_input_model_path)
     return model_wrapper
 
   def get_metrics_collector(self, prefix: str = ''):
@@ -1580,9 +1661,20 @@ class _RunInferenceDoFn(beam.DoFn, Generic[ExampleT, PredictionT]):
   def _run_inference(self, batch, inference_args):
     start_time = _to_microseconds(self._clock.time_ns())
     try:
-      model = self._model.next_model()
-      result_generator = self._model_handler.run_inference(
-          batch, model, inference_args)
+      model_wrapper = self._model.next_model_wrapper()
+      model = model_wrapper.get_model()
+      if self._timeout is not None:
+        if self._pool is None:
+          self._pool = concurrent.futures.ThreadPoolExecutor(10)
+        try:
+          result_generator = self._pool.submit(self._model_handler.run_inference, batch, model, inference_args).result(
+                  self._timeout)
+        except TimeoutError:
+          model_wrapper.reset_model()
+          raise Exception('Timed out waiting for model inference to complete')
+      else:
+        result_generator = self._model_handler.run_inference(
+            batch, model, inference_args)
     except BaseException as e:
       if self._metrics_collector:
         self._metrics_collector.failed_batches_counter.inc()

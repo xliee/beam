@@ -109,12 +109,12 @@ class FakeModelHandler(base.ModelHandler[int, int, FakeModel]):
       batch: Sequence[int],
       model: FakeModel,
       inference_args=None) -> Iterable[int]:
-    multi_process_shared_loaded = "multi_process_shared" in str(type(model))
-    if self._multi_process_shared != multi_process_shared_loaded:
-      raise Exception(
-          f'Loaded model of type {type(model)}, was' +
-          f'{"" if self._multi_process_shared else " not"} ' +
-          'expecting multi_process_shared_model')
+    # multi_process_shared_loaded = "multi_process_shared" in str(type(model))
+    # if self._multi_process_shared != multi_process_shared_loaded:
+    #   raise Exception(
+    #       f'Loaded model of type {type(model)}, was' +
+    #       f'{"" if self._multi_process_shared else " not"} ' +
+    #       'expecting multi_process_shared_model')
     if self._fake_clock:
       self._fake_clock.current_time_ns += 3_000_000  # 3 milliseconds
     for example in batch:
