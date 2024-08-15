@@ -252,9 +252,6 @@ class FlinkRunnerTest(portable_runner_test.PortableRunnerTest):
                 'LongDeserializer',
                 commit_offset_in_finalize=True,
                 timestamp_policy=ReadFromKafka.create_time_policy,
-                redistribute=False,
-                redistribute_num_keys=0,
-                allow_duplicates=False,
                 expansion_service=self.get_expansion_service()))
     self.assertTrue(
         'No resolvable bootstrap urls given in bootstrap.servers' in str(

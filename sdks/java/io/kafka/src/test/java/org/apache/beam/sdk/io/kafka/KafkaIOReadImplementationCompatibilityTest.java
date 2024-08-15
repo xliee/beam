@@ -103,9 +103,7 @@ public class KafkaIOReadImplementationCompatibilityTest {
 
   private void testReadTransformCreationWithImplementationBoundProperties(
       Function<KafkaIO.Read<Integer, Long>, KafkaIO.Read<Integer, Long>> kafkaReadDecorator) {
-    p.apply(
-        kafkaReadDecorator.apply(
-            mkKafkaReadTransform(1000, null, new ValueAsTimestampFn(), false, 0)));
+    p.apply(kafkaReadDecorator.apply(mkKafkaReadTransform(1000, null, new ValueAsTimestampFn())));
     p.run();
   }
 
