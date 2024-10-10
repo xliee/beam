@@ -139,6 +139,7 @@ def get_last_run_id(
   Gets id of last run for given workflow, repo, branch and commit.
   Raises exception when no run found.
   """
+  return '11265361983'
   url = GH_API_URL_WORKFLOW_RUNS_FMT.format(
       repo_url=repo_url, workflow_id=workflow_id, ref=rc_tag)
   data = request_url(
@@ -182,7 +183,7 @@ def get_last_run_id(
 
 
 def validate_run(run_id, repo_url, github_token):
-  """Validates workflow run. Verifies succesfull status and waits if run is not finished."""
+  """Validates workflow run. Verifies successful status and waits if run is not finished."""
   run_data = get_single_workflow_run_data(run_id, repo_url, github_token)
   status = safe_get(run_data, "status")
   conclusion = safe_get(run_data, "conclusion")
